@@ -1,0 +1,6 @@
+{
+  "name": "Vela Charting Library",
+  "description": "An open-source financial charting library with a high-performance WebGL2/Canvas2D renderer and drawing tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

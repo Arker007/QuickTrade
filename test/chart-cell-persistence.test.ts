@@ -1,0 +1,382 @@
+// @vitest-environment jsdom
+import { describe, it, expect, vi } from 'vitest';
+
+// This jsdom build ships no `CSS` global; the style injector only needs `escape`.
+(globalThis as { CSS?: unknown }).CSS ??= { escape: (v: string) => v };
+
+import { ChartCell, type CellBoot, type CellDeps } from '../src/workspace/ChartCell';
+import type {
+    IChartRenderer,
+    RendererCapabilities,
+    IndicatorRenderHandle,
+    VisibleRange,
+    InputChangeEvent,
+    ClickEvent,
+    CrosshairEvent,
+} from '../src/core/ports/IChartRenderer';
+import type { MarketDataFeed } from '../src/core/ports/MarketDataFeed';
+import type { OHLCV } from '../src/core/model/ohlcv';
+import type { InputValue } from '../src/core/model/inputs';
+import type { IndicatorModel, Pane, ScenePatch } from '../src/core/model';
+import type { PriceStyle } from '../src/core/options';
+import type { Unsubscribe } from '../src/core/util/types';
+import { DARK_THEME } from '../src/core/theme';
+
+/**
+ * The ChartCell persistence round-trip — the layer the unit suite never covered
+ * (dehydrate reads LIVE handles, applyIndicatorLedger converges them): the
+ * regression net for the native settings/visibility persistence work (#146,
+ * #149). The chart runs for real (classic natives compute in-process); only the
+ * renderer and the data feed are fakes, per the orchestrator tests' pattern.
+ */
+
+const FIVE_MIN = 300_000;
+const makeBars = (n: number): OHLCV[] =>
+    Array.from({ length: n }, (_, i) => ({
+        time: 1_700_000_000_000 + i * FIVE_MIN,
+        open: 100 + i,
+        high: 101 + i,
+        low: 99 + i,
+        close: 100.5 + i,
+        volume: 10 + i,
+    }));
+
+class MockDataFeed implements MarketDataFeed {
+    load(): Promise<OHLCV[]> {
+        return Promise.resolve(makeBars(60));
+    }
+    subscribe(): Unsubscribe {
+        return () => {};
+    }
+}
+
+/** Minimal renderer: records mounts/visibility, honors nothing visual. */
+class FakeRenderer implements IChartRenderer {
+    readonly capabilities: RendererCapabilities = {
+        panes: true,
+        paneManagement: false,
+        fills: 'primitive',
+        bgcolor: 'primitive',
+        hline: 'native',
+        markers: true,
+        barcolor: 'approximated',
+        perPointColor: true,
+        drawings: true,
+        userDrawings: false,
+        tables: true,
+        inputsUI: true,
+    };
+    readonly name = 'fake';
+    readonly features: readonly string[] = [];
+    mount(): void {}
+    setTheme(): void {}
+    resize(): void {}
+    style: string = 'candles';
+    applyFeature(key: string, value: unknown): void {
+        if (key === 'priceStyle' && typeof value === 'string') this.style = value;
+    }
+    readFeature(key: string): unknown {
+        return key === 'priceStyle' ? this.style : undefined;
+    }
+    // The cosmetic-config seam: a document lands, the change is announced (the real
+    // renderer's `applyConfig` ends the same way).
+    private configCbs = new Set<() => void>();
+    applyConfig(_config: unknown): void {
+        for (const cb of this.configCbs) cb();
+    }
+    onConfigChanged(cb: () => void): Unsubscribe {
+        this.configCbs.add(cb);
+        return () => this.configCbs.delete(cb);
+    }
+    destroy(): void {}
+    setBars(): void {}
+    updateBar(): void {}
+    ensurePane(_p: Pane): void {}
+    removePane(): void {}
+    mountedIds: string[] = [];
+    mountIndicator(model: IndicatorModel): IndicatorRenderHandle {
+        this.mountedIds.push(model.id);
+        return { id: model.id };
+    }
+    updateIndicator(_h: IndicatorRenderHandle, _p: ScenePatch): void {}
+    removeIndicator(): void {}
+    setIndicatorInputs(_h: IndicatorRenderHandle, _v: Record<string, InputValue>): void {}
+    rowVisibility = new Map<string, boolean>();
+    setIndicatorVisible(h: IndicatorRenderHandle, v: boolean): void {
+        this.rowVisibility.set(h.id, v);
+    }
+    onInputChange(_cb: (e: InputChangeEvent) => void): Unsubscribe {
+        return () => {};
+    }
+    onRemoveIndicator(_cb: (id: string) => void): Unsubscribe {
+        return () => {};
+    }
+    onToggleIndicatorVisible(_cb: (id: string, visible: boolean) => void): Unsubscribe {
+        return () => {};
+    }
+    onCrosshairMove(_cb: (e: CrosshairEvent) => void): Unsubscribe {
+        return () => {};
+    }
+    onClick(_cb: (e: ClickEvent) => void): Unsubscribe {
+        return () => {};
+    }
+    getVisibleRange(): VisibleRange | null {
+        return null;
+    }
+    setVisibleRange(): void {}
+    onViewportChange(_cb: (r: VisibleRange) => void): Unsubscribe {
+        return () => {};
+    }
+    onPriceStyleChange(_cb: (style: PriceStyle) => void): Unsubscribe {
+        return () => {};
+    }
+    nativePushes: Array<[string, unknown]> = [];
+    setNativeData(type: string, data: unknown): void {
+        this.nativePushes.push([type, data]);
+    }
+    setIndicatorStatus(): void {}
+}
+
+/** The most recently constructed FakeRenderer (Vela instantiates the class). */
+let lastRenderer: FakeRenderer | null = null;
+class TrackedRenderer extends FakeRenderer {
+    constructor() {
+        super();
+        lastRenderer = this;
+    }
+}
+
+function makeDeps(over: Partial<CellDeps> = {}): CellDeps {
+    return {
+        feed: new MockDataFeed(),
+        engines: {},
+        chartDefaults: { renderer: TrackedRenderer, drawings: false } as CellDeps['chartDefaults'],
+        theme: DARK_THEME,
+        live: false,
+        volume: true,
+        statusline: false,
+        watermark: false,
+        nativeBackend: 'canvas2d',
+        dialogHost: document.body,
+        timezone: () => 'Etc/UTC',
+        setTimezone: () => {},
+        context: () => ({}) as never,
+        manifestSettled: () => true,
+        activate: () => {},
+        multiCell: () => false,
+        isMaximized: () => false,
+        toggleMaximize: () => {},
+        cellDragTarget: () => null,
+        previewDropTarget: () => {},
+        dropCell: () => {},
+        onMarketChanged: () => {},
+        onPriceStyleChanged: () => {},
+        onIndicatorsChanged: () => {},
+        onStatusPrefsChanged: () => {},
+        onStateDirty: () => {},
+        toast: () => {},
+        ...over,
+    };
+}
+
+const SEED: CellBoot = {
+    symbol: 'BINANCE:BTCUSDT',
+    timeframe: '60',
+    priceStyle: 'candles',
+} as CellBoot;
+
+function makeCell(seed: Partial<CellBoot> = {}, deps: Partial<CellDeps> = {}): ChartCell {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    return new ChartCell('c1', host, { ...SEED, ...seed } as CellBoot, makeDeps(deps));
+}
+
+const settle = () => new Promise((r) => setTimeout(r, 20));
+
+const aroonOf = (cell: ChartCell) => cell.chart.indicators().find((h) => h.nativeType === 'aroon');
+const volumeOf = (cell: ChartCell) => cell.chart.indicators().find((h) => h.nativeType === 'volume');
+
+describe('ChartCell native persistence round-trip (#146/#149)', () => {
+    it('a stored-input seed boots WITHOUT computing against unloaded bars (the #149 crash) and applies values + hidden', async () => {
+        // Pre-#149 this threw inside the constructor: applyNativeLedgerEntry called
+        // setInputs before start(), and ClassicIndicator.recompute read bars off a
+        // null context — killing workspace boot.
+        const cell = makeCell({
+            indicators: { natives: [{ type: 'volume', hidden: true }, { type: 'aroon', inputs: { length: 50 } }], manifest: [] },
+        } as Partial<CellBoot>);
+        await settle();
+        const aroon = aroonOf(cell)!;
+        expect(aroon.inputValues().length).toBe(50);
+        expect(aroon.visible).toBe(true);
+        expect(volumeOf(cell)!.visible).toBe(false);
+        cell.destroy();
+    });
+
+    it('dehydrate captures the live deltas and hidden flags; defaults collapse to bare types', async () => {
+        const cell = makeCell({ indicators: { natives: ['volume', 'aroon'], manifest: [] } } as Partial<CellBoot>);
+        await settle();
+        aroonOf(cell)!.setInput('length', 50);
+        volumeOf(cell)!.setVisible(false);
+        const led = cell.dehydrate().indicators!;
+        expect(led.natives).toEqual([{ type: 'volume', hidden: true }, { type: 'aroon', inputs: { length: 50 } }]);
+        cell.destroy();
+    });
+
+    it('rehydrate converges a DRIFTED chart back to the document', async () => {
+        const cell = makeCell({ indicators: { natives: ['volume', 'aroon'], manifest: [] } } as Partial<CellBoot>);
+        await settle();
+        const saved = {
+            ...SEED,
+            indicators: { natives: [{ type: 'volume', hidden: true }, { type: 'aroon', inputs: { length: 50 } }], manifest: [] },
+        };
+        // Drift the live chart away from the document…
+        aroonOf(cell)!.setInput('length', 21);
+        volumeOf(cell)!.setVisible(true);
+        // …and the document wins on rehydrate.
+        cell.rehydrate(saved as never);
+        await settle();
+        expect(aroonOf(cell)!.inputValues().length).toBe(50);
+        expect(volumeOf(cell)!.visible).toBe(false);
+        cell.destroy();
+    });
+
+    it('a LEGACY bare-string ledger resets to declaration defaults, visible, without duplicating', async () => {
+        const cell = makeCell({
+            indicators: { natives: [{ type: 'volume', hidden: true }, { type: 'aroon', inputs: { length: 50 } }], manifest: [] },
+        } as Partial<CellBoot>);
+        await settle();
+        cell.rehydrate({ ...SEED, indicators: { natives: ['volume', 'aroon'], manifest: [] } } as never);
+        await settle();
+        const natives = cell.chart.indicators().filter((h) => h.nativeType !== undefined);
+        expect(natives).toHaveLength(2);
+        expect(aroonOf(cell)!.inputValues().length).toBe(14); // declaration default
+        expect(volumeOf(cell)!.visible).toBe(true);
+        cell.destroy();
+    });
+
+    it('a native RESTORED HIDDEN still mounts a dimmed legend row (the unhide affordance must exist)', async () => {
+        // Before this, a hidden ledger entry re-added its native and hid it pre-start;
+        // startNativeIndicator bails on hidden records, no model ever mounted, so the
+        // legend had NO row — the indicator was invisible AND unreachable after reload.
+        const cell = makeCell({
+            indicators: { natives: [{ type: 'volume', hidden: true }, { type: 'aroon', inputs: { length: 50 }, hidden: true }], manifest: [] },
+        } as Partial<CellBoot>);
+        await settle();
+        const renderer = lastRenderer!;
+        const volume = volumeOf(cell)!;
+        const aroon = aroonOf(cell)!;
+        expect(renderer.mountedIds).toContain(volume.id); // row exists…
+        expect(renderer.rowVisibility.get(volume.id)).toBe(false); // …marked hidden
+        expect(renderer.mountedIds).toContain(aroon.id); // pane natives too
+        expect(renderer.rowVisibility.get(aroon.id)).toBe(false);
+        cell.destroy();
+    });
+
+    it('un-hiding a RESTORED-HIDDEN native STARTS it (never-started instances must not stay blank)', async () => {
+        // The regression behind the volume/vpvr guards: an indicator restored hidden
+        // never starts (startNativeIndicator bails on hidden records), so the show
+        // path's resume() used to poke a context-less instance — a crash before the
+        // guards, a permanently blank row with guards alone. The orchestrator now
+        // STARTS a never-started instance on show; the layer push proves it ran.
+        const cell = makeCell({
+            indicators: { natives: [{ type: 'volume', hidden: true }], manifest: [] },
+        } as Partial<CellBoot>);
+        await settle();
+        const renderer = lastRenderer!;
+        renderer.nativePushes.length = 0;
+        volumeOf(cell)!.setVisible(true);
+        await settle();
+        expect(volumeOf(cell)!.visible).toBe(true);
+        expect(renderer.nativePushes.some(([type]) => type === 'volume')).toBe(true);
+        cell.destroy();
+    });
+
+    it('a price style changed THROUGH the config (applyConfig / template import) reaches the workspace chrome', async () => {
+        // The topbar style icon follows `onPriceStyleChanged`; before this the cell only
+        // raised it from its own `setPriceStyle`, so a style landing via `applyConfig`
+        // (a settings-dialog document, an imported template) left the icon stale.
+        const onPriceStyleChanged = vi.fn();
+        const cell = makeCell({}, { onPriceStyleChanged });
+        await settle();
+        const renderer = lastRenderer!;
+        onPriceStyleChanged.mockClear();
+        renderer.style = 'line';
+        renderer.applyConfig({ series: { style: 'line' } });
+        expect(cell.priceStyle).toBe('line');
+        expect(onPriceStyleChanged).toHaveBeenCalledWith('c1');
+        expect(cell.dehydrate().priceStyle).toBe('line');
+        // An unrelated config edit (same style) raises nothing — no spurious re-projection.
+        onPriceStyleChanged.mockClear();
+        renderer.applyConfig({ grid: { vertLines: { visible: false } } });
+        expect(onPriceStyleChanged).not.toHaveBeenCalled();
+        cell.destroy();
+    });
+
+    it('the legend eye marks the cell state dirty (the save trigger for visibility)', async () => {
+        const onStateDirty = vi.fn();
+        const cell = makeCell({ indicators: { natives: ['aroon'], manifest: [] } } as Partial<CellBoot>, { onStateDirty });
+        await settle();
+        onStateDirty.mockClear();
+        aroonOf(cell)!.setVisible(false);
+        await settle();
+        expect(onStateDirty).toHaveBeenCalled();
+        cell.destroy();
+    });
+});
+
+describe('ChartCell external indicators keep their id (ctx.addIndicator({ id }) + undo/redo)', () => {
+    // No engine is registered in this harness: the script never runs, but the indicator is
+    // still claimed, listed, and removable under its id — which is all these tests read.
+    const scriptIds = (cell: ChartCell) => cell.chart.indicators().filter((h) => h.nativeType === undefined).map((h) => h.id);
+
+    it('a host id is honored on the chart, and undo/redo re-add the indicator under the SAME id', async () => {
+        const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const cell = makeCell({ indicators: { natives: [], manifest: [] } } as Partial<CellBoot>);
+        await settle();
+        cell.addExternalIndicator({ name: 'My RSI', script: 'plot(close)', id: 'plugin:rsi:42' });
+        expect(scriptIds(cell)).toEqual(['plugin:rsi:42']);
+
+        cell.history.undo();
+        expect(scriptIds(cell)).toEqual([]);
+        cell.history.redo();
+        expect(scriptIds(cell)).toEqual(['plugin:rsi:42']); // not a freshly minted id
+        quiet.mockRestore();
+        cell.destroy();
+    });
+
+    it('without a host id the minted id is recorded too — a resurrection keeps it', async () => {
+        const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const cell = makeCell({ indicators: { natives: [], manifest: [] } } as Partial<CellBoot>);
+        await settle();
+        cell.addExternalIndicator({ name: 'Minted', script: 'plot(close)' });
+        const [minted] = scriptIds(cell);
+        expect(minted).toBeTruthy();
+        cell.history.undo();
+        cell.history.redo();
+        expect(scriptIds(cell)).toEqual([minted]);
+        quiet.mockRestore();
+        cell.destroy();
+    });
+
+    it('a host id already live on the cell is rejected: no ghost instance, no history entry, the live one untouched', async () => {
+        const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const cell = makeCell({ indicators: { natives: [], manifest: [] } } as Partial<CellBoot>);
+        await settle();
+        cell.addExternalIndicator({ name: 'A', script: 'plot(close)', id: 'same' });
+        const [live] = cell.chart.indicators().filter((h) => h.nativeType === undefined);
+        cell.addExternalIndicator({ name: 'B', script: 'plot(open)', id: 'same' });
+
+        expect(cell.instances).toHaveLength(1);
+        expect(cell.onChartRows().filter((r) => !r.native)).toHaveLength(1); // no ghost picker row
+        expect(cell.chart.indicators().filter((h) => h.nativeType === undefined)).toEqual([live]);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('failed to add'), expect.objectContaining({ message: expect.stringContaining('"same" is already live') }));
+        // The rejected add recorded nothing: one undo removes the live one and leaves nothing to undo.
+        cell.history.undo();
+        expect(cell.history.canUndo).toBe(false);
+        expect(cell.instances).toHaveLength(0);
+        warn.mockRestore();
+        quiet.mockRestore();
+        cell.destroy();
+    });
+});
