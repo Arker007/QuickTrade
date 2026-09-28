@@ -364,7 +364,8 @@ export class ChromeRenderer {
         }
 
         // ── axis chips: last-price label and/or countdown ──
-        const cdText = scene.showCountdown ? countdownText(last.time, coords.barInterval, Date.now()) : null;
+        const serverOffset = (typeof window !== 'undefined' && (window as any).SERVER_TIME_OFFSET) || 0;
+        const cdText = scene.showCountdown ? countdownText(last.time, coords.barInterval, Date.now() - serverOffset) : null;
         const showCountdown = cdText !== null;
         const showLabel = scene.showPriceLabel;
         if (!showLabel && !showCountdown) return;

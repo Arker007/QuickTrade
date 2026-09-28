@@ -6,6 +6,8 @@ export { RendererControl } from './core/RendererControl';
 // `chart.renderer.setWallClock` so the countdown chip never reads a different second.
 export { SecondClock, type WallClock } from './core/util/wall-clock';
 export { NativeRenderer } from './renderers/native/NativeRenderer';
+export { SmoothCandleEngine, DynamicCandleBufferStream } from './renderers/native/core/SmoothCandleEngine';
+export { CandleInterpolator, WebGLCandleRenderer, CandleStateManager, ChartApplication } from './renderers/native/core/CandleInterpolator';
 // The drawing-toolbar VIEW as a standalone component — a workspace shell mounts ONE
 // shared bar (dock:'static') and routes it to the active chart's `chart.drawings`.
 export { DrawingToolbar, type DrawingToolbarOptions } from './renderers/native/drawings/DrawingToolbar';

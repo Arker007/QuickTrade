@@ -59,6 +59,18 @@ export class BinomoForexProvider implements DataProvider {
                 this.fetchCache.delete(url); // don't cache errors
                 return { data: [] };
             }
+            // Sync with backend server clock using the HTTP Date response header
+            try {
+                const serverDateStr = res.headers.get('Date');
+                if (serverDateStr && typeof window !== 'undefined') {
+                    const serverMs = new Date(serverDateStr).getTime();
+                    if (!isNaN(serverMs)) {
+                        (window as any).SERVER_TIME_OFFSET = Date.now() - serverMs;
+                    }
+                }
+            } catch {
+                // ignore
+            }
             return res.json();
         }).catch((err) => {
             this.fetchCache.delete(url);
@@ -340,8 +352,12 @@ export class BinomoForexProvider implements DataProvider {
                     const bodyTicks = Math.round(Math.abs(close - open) / (mintick || 0.0000000001));
                     volume = Math.max(10, Math.round((rangeTicks + bodyTicks * 0.5 + 15) * 1.5));
                 }
+                const closeTime = parseUTCDate(item.created_at);
+                // Binomo 60s candles report created_at at candle close (end of the 60s period).
+                // Charting conventions require the bar's open time (start of the 1-minute period).
+                const time = Math.round(closeTime / 60_000) * 60_000 - 60_000;
                 return {
-                    time: new Date(item.created_at).getTime(),
+                    time,
                     open,
                     high,
                     low,
@@ -485,127 +501,377 @@ export class BinomoForexProvider implements DataProvider {
 
     subscribe(ticker: string, timeframe: string, onBar: (bar: OHLCV) => void): Unsubscribe {
         let stopped = false;
-        let timer: ReturnType<typeof setTimeout> | null = null;
-        let animFrameId: number | null = null;
+        let pollingTimer: ReturnType<typeof setTimeout> | null = null;
+        let eventSource: EventSource | null = null;
+
+        const resolved = this.resolveSymbol(ticker);
+        const topicAsset = resolved.apiSymbol.replace(/%2F/g, '/');
+        const tfMs = timeframeToMs(timeframe);
 
         // Keep track of the active candle state
         let activeTime = 0;
+        let currentOpen = 0;
         let currentClose = 0;
+        let targetClose = 0;
         let currentHigh = 0;
         let currentLow = 0;
+        let currentVolume = 0;
 
-        // Track last emitted values to avoid unnecessary rendering
-        let lastEmittedBarStr = '';
+        let lerpRaf: number | null = null;
+        let lerpLastTime = 0;
+        let velocityClose = 0;
+        const isCryptoIdx = resolved.apiSymbol === 'Z-CRY%2FIDX';
+        const lerpFactor = isCryptoIdx ? 0.96 : 0.12;
 
-        // Animation config
-        const animDuration = 200; // ms
-        let animStartTime = 0;
-        let startClose = 0;
-        let targetClose = 0;
-        let startHigh = 0;
-        let targetHigh = 0;
-        let startLow = 0;
-        let targetLow = 0;
+        const lerp = (start: number, end: number, factor: number) => start + (end - start) * factor;
 
-        let lastBars: OHLCV[] = [];
-
-        const animate = () => {
-            if (stopped) return;
-            const now = Date.now();
-            const elapsed = now - animStartTime;
-            const progress = Math.min(elapsed / animDuration, 1);
-
-            // Cubic easing out for ultra-organic movement
-            const t = 1 - Math.pow(1 - progress, 3);
-
-            // Interpolate values
-            currentClose = startClose + (targetClose - startClose) * t;
-            currentHigh = Math.max(startHigh + (targetHigh - startHigh) * t, currentClose);
-            currentLow = Math.min(startLow + (targetLow - startLow) * t, currentClose);
-
-            // Read latest fetched bars
-            if (lastBars.length > 0) {
-                const clonedBars = lastBars.map((b, i) => {
-                    if (i === lastBars.length - 1) {
-                        return {
-                            ...b,
-                            close: currentClose,
-                            high: currentHigh,
-                            low: currentLow,
-                        };
-                    }
-                    return b;
-                });
-
-                // Send the interpolated bars to the chart!
-                const latest = clonedBars[clonedBars.length - 1];
-                if (latest) {
-                    const signature = `${latest.time}-${latest.open}-${latest.high}-${latest.low}-${latest.close}`;
-                    if (signature !== lastEmittedBarStr) {
-                        lastEmittedBarStr = signature;
-                        for (const b of clonedBars) {
-                            onBar(b);
-                        }
-                    }
+        const stopLerp = () => {
+            if (lerpRaf !== null) {
+                if (typeof cancelAnimationFrame === 'function') {
+                    cancelAnimationFrame(lerpRaf);
                 }
-            }
-
-            if (progress < 1) {
-                animFrameId = requestAnimationFrame(animate);
+                lerpRaf = null;
             }
         };
 
-        const poll = async (): Promise<void> => {
+        let lastEmittedBarStr = '';
+        let lastLiveTickTime = 0;
+
+        const emitBar = (bar: OHLCV) => {
+            const signature = `${bar.time}-${bar.open}-${bar.high}-${bar.low}-${bar.close}-${bar.volume ?? 0}`;
+            if (signature !== lastEmittedBarStr) {
+                lastEmittedBarStr = signature;
+                onBar(bar);
+            }
+        };
+
+        const startLerpAnimation = () => {
+            if (typeof requestAnimationFrame === 'undefined') {
+                currentClose = targetClose;
+                emitBar({
+                    time: activeTime,
+                    open: currentOpen,
+                    high: currentHigh,
+                    low: currentLow,
+                    close: currentClose,
+                    volume: currentVolume,
+                });
+                return;
+            }
+            if (lerpRaf !== null) return;
+
+            lerpLastTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
+            const step = (now: number) => {
+                if (stopped || activeTime === 0) {
+                    lerpRaf = null;
+                    return;
+                }
+
+                const dtMs = Math.min(Math.max(1, now - lerpLastTime), 64);
+                lerpLastTime = now;
+
+                const diff = targetClose - currentClose;
+                if (Math.abs(diff) < 1e-7) {
+                    currentClose = targetClose;
+                    currentHigh = Math.max(currentHigh, currentClose);
+                    currentLow = Math.min(currentLow, currentClose);
+                    emitBar({
+                        time: activeTime,
+                        open: currentOpen,
+                        high: currentHigh,
+                        low: currentLow,
+                        close: currentClose,
+                        volume: currentVolume,
+                    });
+                    lerpRaf = null;
+                    return;
+                }
+
+                const algo = (typeof window !== 'undefined' && (window as any).BINOMO_INTERPOLATION_ALGO) || 'decay';
+
+                if (algo === 'spring') {
+                    const stiffness = 0.08;
+                    const damping = 0.72;
+                    const frameRatio = dtMs / 16.667;
+                    const force = diff * stiffness;
+                    velocityClose = (velocityClose + force * frameRatio) * Math.pow(damping, frameRatio);
+                    currentClose += velocityClose * frameRatio;
+                } else if (algo === 'step') {
+                    currentClose = targetClose;
+                    velocityClose = 0;
+                } else {
+                    // Binomo's exact frame-rate independent LERP calculation
+                    const frameRatio = dtMs / 16.667;
+                    const effectiveFactor = 1 - Math.pow(1 - lerpFactor, frameRatio);
+                    currentClose = lerp(currentClose, targetClose, effectiveFactor);
+                    velocityClose = 0;
+                }
+
+                currentHigh = Math.max(currentHigh, currentClose);
+                currentLow = Math.min(currentLow, currentClose);
+
+                emitBar({
+                    time: activeTime,
+                    open: currentOpen,
+                    high: currentHigh,
+                    low: currentLow,
+                    close: currentClose,
+                    volume: currentVolume,
+                });
+
+                lerpRaf = requestAnimationFrame(step);
+            };
+
+            lerpRaf = requestAnimationFrame(step);
+        };
+
+        const applyLiveTick = (price: number, tickTime: number, partialCandle?: Partial<OHLCV>) => {
+            if (stopped || !price || isNaN(price) || price <= 0) return;
+            lastLiveTickTime = Date.now();
+
+            const currentLocalBarOpen = Math.floor(Date.now() / tfMs) * tfMs;
+
+            let computedBarTime: number;
+            if (tickTime > 0 && tickTime % tfMs === 0) {
+                // Exact period boundary timestamp (e.g. 10:35:00.000 for 60s bar) from a closed candle created_at
+                computedBarTime = tickTime - tfMs;
+            } else if (tickTime > 0) {
+                // Intra-period live tick timestamp (e.g. 10:34:08.123 for 60s bar)
+                computedBarTime = Math.floor(tickTime / tfMs) * tfMs;
+            } else {
+                computedBarTime = currentLocalBarOpen;
+            }
+
+            // Use computedBarTime directly without capping to the lagging local machine clock to avoid artificial delays
+            const barTime = computedBarTime;
+
+            if (barTime > activeTime) {
+                // A new bar opened
+                stopLerp();
+                activeTime = barTime;
+                currentOpen = partialCandle?.open ?? price;
+                currentHigh = Math.max(partialCandle?.high ?? price, price);
+                currentLow = Math.min(partialCandle?.low ?? price, price);
+                targetClose = partialCandle?.close ?? price;
+                currentClose = targetClose;
+                currentVolume = partialCandle?.volume ?? 1;
+
+                emitBar({
+                    time: activeTime,
+                    open: currentOpen,
+                    high: currentHigh,
+                    low: currentLow,
+                    close: currentClose,
+                    volume: currentVolume,
+                });
+            } else if (barTime === activeTime || activeTime === 0) {
+                if (activeTime === 0) activeTime = barTime;
+                if (!currentOpen) currentOpen = partialCandle?.open ?? price;
+                currentHigh = Math.max(currentHigh || currentOpen, price, partialCandle?.high ?? price);
+                currentLow = Math.min(currentLow || currentOpen, price, partialCandle?.low ?? price);
+                targetClose = partialCandle?.close ?? price;
+                currentClose = targetClose;
+                currentVolume = (currentVolume || 0) + (partialCandle?.volume ?? 1);
+
+                emitBar({
+                    time: activeTime,
+                    open: currentOpen,
+                    high: currentHigh,
+                    low: currentLow,
+                    close: currentClose,
+                    volume: currentVolume,
+                });
+
+                startLerpAnimation();
+            }
+        };
+
+        const pollBars = async (): Promise<void> => {
             if (stopped) return;
             try {
                 const bars = await this.getBars(ticker, timeframe, { limit: 2 });
-                if (stopped) return;
-                
-                if (bars.length > 0) {
-                    lastBars = bars;
-                    const latest = bars[bars.length - 1];
-                    if (latest) {
-                        if (latest.time !== activeTime) {
-                            // If it's a brand new candle, reset active parameters instantly to avoid sliding from previous candle values
-                            activeTime = latest.time;
-                            currentClose = latest.close;
-                            currentHigh = latest.high;
-                            currentLow = latest.low;
-                            
-                            // Emit immediately to register the new candle open
-                            for (const b of bars) {
-                                onBar(b);
-                            }
-                        } else {
-                            // Otherwise, smooth-interpolate from the last interpolated position to the new target
-                            startClose = currentClose;
-                            targetClose = latest.close;
+                if (stopped || bars.length === 0) return;
 
-                            startHigh = currentHigh;
-                            targetHigh = latest.high;
+                const isReceivingLiveTicks = lastLiveTickTime > 0 && Date.now() - lastLiveTickTime < 30_000;
+                const currentLocalBarOpen = Math.floor(Date.now() / tfMs) * tfMs;
 
-                            startLow = currentLow;
-                            targetLow = latest.low;
+                const rawLatest = bars[bars.length - 1]!;
+                const latestTime = rawLatest.time;
+                const latest = { ...rawLatest, time: latestTime };
 
-                            animStartTime = Date.now();
-                            if (animFrameId) cancelAnimationFrame(animFrameId);
-                            animFrameId = requestAnimationFrame(animate);
-                        }
+                if (latest.time > activeTime && activeTime !== 0 && bars.length >= 2) {
+                    const rawPrev = bars[bars.length - 2]!;
+                    const prevTime = Math.min(rawPrev.time, activeTime);
+                    emitBar({ ...rawPrev, time: prevTime });
+                }
+                if (latest.time > activeTime) {
+                    activeTime = latest.time;
+                    currentOpen = latest.open;
+                    currentHigh = latest.high;
+                    currentLow = latest.low;
+                    if (!isReceivingLiveTicks) {
+                        targetClose = latest.close;
+                        currentClose = latest.close;
+                    }
+                    currentVolume = latest.volume ?? 0;
+                    emitBar({
+                        time: activeTime,
+                        open: currentOpen,
+                        high: currentHigh,
+                        low: currentLow,
+                        close: currentClose,
+                        volume: currentVolume,
+                    });
+                } else if (latest.time === activeTime) {
+                    if (!currentOpen) currentOpen = latest.open;
+                    currentHigh = Math.max(currentHigh || latest.high, latest.high);
+                    currentLow = Math.min(currentLow || latest.low, latest.low);
+                    if (!isReceivingLiveTicks) {
+                        targetClose = latest.close;
+                        currentClose = latest.close;
+                        currentVolume = Math.max(currentVolume || 0, latest.volume ?? 0);
+                        emitBar({
+                            time: activeTime,
+                            open: currentOpen,
+                            high: currentHigh,
+                            low: currentLow,
+                            close: currentClose,
+                            volume: currentVolume,
+                        });
                     }
                 }
             } catch {
-                // transient error — keep polling
+                // transient error — continue polling
             }
             if (!stopped) {
-                timer = setTimeout(() => void poll(), 250);
+                pollingTimer = setTimeout(() => void pollBars(), 500);
             }
         };
 
-        timer = setTimeout(() => void poll(), 250);
+        // Start background polling immediately so candle is never paused
+        void pollBars();
+
+        // Connect to SSE stream if running in browser
+        if (typeof window !== 'undefined' && typeof EventSource !== 'undefined') {
+            try {
+                // Request backend WS to join the specific asset topic
+                void fetch(`/api/binomo/join?asset=${encodeURIComponent(topicAsset)}`).catch(() => {});
+
+                eventSource = new EventSource(`/events?asset=${encodeURIComponent(topicAsset)}`);
+
+                eventSource.onmessage = (e: MessageEvent) => {
+                    if (stopped) return;
+                    try {
+                        const msg = JSON.parse(e.data);
+                        if (!msg || typeof msg !== 'object') return;
+
+                        if (msg.event === 'connected' && typeof msg.time === 'number') {
+                            if (typeof window !== 'undefined') {
+                                (window as any).SERVER_TIME_OFFSET = Date.now() - msg.time;
+                            }
+                            return;
+                        }
+
+                        const topic: string = msg.topic || '';
+                        if (topic && topic !== 'connection') {
+                            const cleanTopic = topic.replace(/^(asset:|range_stream:|cfd:)/, '');
+                            const cleanNorm = cleanTopic.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+                            const targetNorm = topicAsset.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+                            const baseNorm = resolved.base.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+
+                            const isMatch = cleanNorm === targetNorm || cleanNorm.includes(targetNorm) || targetNorm.includes(cleanNorm) || cleanNorm === baseNorm || cleanNorm.startsWith(baseNorm);
+                            if (!isMatch) {
+                                return;
+                            }
+                        }
+
+                        const payload = msg.payload ?? {};
+                        let tickPrice: number | null = null;
+                        let tickTime = Date.now();
+                        let partialCandle: Partial<OHLCV> | undefined = undefined;
+
+                        const parseCreatedAt = (val: any) => {
+                            if (!val) return;
+                            const ms = parseUTCDate(val);
+                            if (ms > 0) {
+                                tickTime = ms;
+                            }
+                        };
+
+                        if (typeof payload.rate === 'number') {
+                            tickPrice = payload.rate;
+                            parseCreatedAt(payload.created_at);
+                        } else if (typeof payload.close === 'number') {
+                            tickPrice = payload.close;
+                            parseCreatedAt(payload.created_at);
+                            if (typeof payload.open === 'number') {
+                                partialCandle = {
+                                    open: payload.open,
+                                    high: payload.high ?? payload.close,
+                                    low: payload.low ?? payload.close,
+                                    close: payload.close,
+                                };
+                            }
+                        } else if (typeof payload.value === 'number') {
+                            tickPrice = payload.value;
+                            parseCreatedAt(payload.created_at);
+                        } else if (typeof payload.price === 'number') {
+                            tickPrice = payload.price;
+                            parseCreatedAt(payload.created_at);
+                        } else if (Array.isArray(payload.data) && payload.data.length > 0) {
+                            const last = payload.data[payload.data.length - 1];
+                            if (last && typeof last.close === 'number') {
+                                tickPrice = last.close;
+                                parseCreatedAt(last.created_at ?? payload.created_at);
+                                if (typeof last.open === 'number') {
+                                    partialCandle = {
+                                        open: last.open,
+                                        high: last.high ?? last.close,
+                                        low: last.low ?? last.close,
+                                        close: last.close,
+                                    };
+                                }
+                            } else if (last && typeof last.rate === 'number') {
+                                tickPrice = last.rate;
+                                parseCreatedAt(last.created_at ?? payload.created_at);
+                            }
+                        } else if (payload.candle && typeof payload.candle.close === 'number') {
+                            tickPrice = payload.candle.close;
+                            parseCreatedAt(payload.candle.created_at ?? payload.created_at);
+                            if (typeof payload.candle.open === 'number') {
+                                partialCandle = {
+                                    open: payload.candle.open,
+                                    high: payload.candle.high ?? payload.candle.close,
+                                    low: payload.candle.low ?? payload.candle.close,
+                                    close: payload.candle.close,
+                                };
+                            }
+                        }
+
+                        if (tickPrice !== null && !isNaN(tickPrice) && tickPrice > 0) {
+                            applyLiveTick(tickPrice, tickTime, partialCandle);
+                        }
+                    } catch {
+                        // ignore malformed frame
+                    }
+                };
+            } catch {
+                // ignore
+            }
+        }
+
         return () => {
             stopped = true;
-            if (timer) clearTimeout(timer);
-            if (animFrameId) cancelAnimationFrame(animFrameId);
+            stopLerp();
+            if (pollingTimer) clearTimeout(pollingTimer);
+            if (eventSource) {
+                try {
+                    eventSource.close();
+                } catch {
+                    // ignore
+                }
+                eventSource = null;
+            }
         };
     }
 }
@@ -622,4 +888,24 @@ function weekStartUTC(ms: number): number {
 function monthStartUTC(ms: number): number {
     const d = new Date(ms);
     return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+}
+
+/** Safely parse any date string or number as UTC */
+function parseUTCDate(val: any): number {
+    if (!val) return 0;
+    if (typeof val === 'number') {
+        return val < 1e11 ? val * 1000 : val;
+    }
+    let str = String(val).trim();
+    if (!str) return 0;
+    if (!str.endsWith('Z') && !str.includes('+') && !/-\d\d:\d\d$/.test(str) && !/GMT|UTC/i.test(str)) {
+        str = str.replace(' ', 'T');
+        if (!str.includes('T')) {
+            str += 'T00:00:00Z';
+        } else {
+            str += 'Z';
+        }
+    }
+    const ms = new Date(str).getTime();
+    return isNaN(ms) ? 0 : ms;
 }

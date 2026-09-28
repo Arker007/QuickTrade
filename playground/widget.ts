@@ -29,18 +29,25 @@ import { playgroundStorage } from './persistence';
 // multi-chart page's own document ('vela-workspace') in the same adapter namespace.
 const storage = playgroundStorage();
 
+const urlParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
+const initSymbol = urlParams?.get('symbol') ?? 'CRYPTO_IDX';
+const initTf = urlParams?.get('tf') ?? urlParams?.get('timeframe') ?? '1';
+const localTz = typeof window !== 'undefined' ? Intl.DateTimeFormat().resolvedOptions().timeZone : 'Etc/UTC';
+
 const ws = new VelaWorkspace('#chart', {
     layout: false, // SINGLE-CHART mode: one cell, no layout picker, no sync switches
-    symbol: 'EURUSD', // bare = first declared provider (binomo); 'coinbase:BTC-USD' pins a venue
-    timeframe: '60',
+    symbol: initSymbol,
+    timeframe: initTf,
+    timezone: localTz || 'Etc/UTC',
     live: true,
+    animations: { liveBar: true },
     theme: 'dark',
     autofocus: true, // the chart IS the page — shortcuts work from the first keystroke
     persist: 'vela-widget', // → 'vela-play:vela-widget' in devtools (the page's historical key)
     storage,
     providers: {
-        biquote: () => new BiquoteProvider(),
         binomo: () => new BinomoForexProvider(),
+        biquote: () => new BiquoteProvider(),
         binance: () => new BinanceProvider()
     },
     engines: {

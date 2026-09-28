@@ -122,9 +122,41 @@ describe('BinomoForexProvider back-date candle fetching', () => {
         const bars = await provider.getBars('CRYPTO_IDX', '1', { limit: 2 });
         expect(bars.length).toBe(2);
         expect(bars[0]!.close).toBe(7515.2);
+        // Created_at '2026-09-22T00:01:00.000Z' represents candle close; bar time must be candle open (00:00:00.000Z)
+        expect(bars[0]!.time).toBe(new Date('2026-09-22T00:00:00.000Z').getTime());
+        expect(bars[1]!.time).toBe(new Date('2026-09-22T00:01:00.000Z').getTime());
 
         const barsWithSlash = await provider.getBars('Z-CRY/IDX', '1', { limit: 2 });
         expect(barsWithSlash.length).toBe(2);
+        expect(barsWithSlash[0]!.time).toBe(new Date('2026-09-22T00:00:00.000Z').getTime());
+    });
+
+    it('correctly maps 1-minute live candle open time for Binomo Crypto IDX', async () => {
+        const provider = new BinomoForexProvider();
+
+        // Simulate live active candle polled during 10:34 UTC (close expected at 10:35:00 UTC)
+        const fakeFetch = vi.fn().mockImplementation((url: string) => {
+            expect(url).toContain('Z-CRY%2FIDX');
+            const data = [
+                { open: 7510.0, high: 7525.0, low: 7505.0, close: 7520.0, created_at: '2026-09-27T10:34:00.000Z' },
+                { open: 7520.0, high: 7535.0, low: 7518.0, close: 7532.5, created_at: '2026-09-27T10:35:00.000Z' },
+            ];
+            return Promise.resolve({
+                ok: true,
+                json: () => Promise.resolve({ data, errors: [], success: true }),
+            });
+        });
+
+        globalThis.fetch = fakeFetch;
+
+        const bars = await provider.getBars('CRYPTO_IDX', '1', { limit: 2 });
+        expect(bars.length).toBe(2);
+
+        // Previous closed candle: 10:33:00 to 10:34:00 -> bar open is 10:33:00
+        expect(bars[0]!.time).toBe(new Date('2026-09-27T10:33:00.000Z').getTime());
+        // Live forming candle: 10:34:00 to 10:35:00 -> bar open is 10:34:00
+        expect(bars[1]!.time).toBe(new Date('2026-09-27T10:34:00.000Z').getTime());
+        expect(bars[1]!.close).toBe(7532.5);
     });
 
     it('provides correct symbol info for Crypto IDX and lists symbols', async () => {
@@ -260,5 +292,85 @@ describe('BinomoForexProvider back-date candle fetching', () => {
 
         const bars = await provider.getBars('EURUSD', '60', { limit: 100 });
         expect(bars).toEqual([]);
+    });
+
+    it('subscribes and updates forming candle from live SSE stream', async () => {
+        const provider = new BinomoForexProvider();
+
+        // Mock window and EventSource
+        (globalThis as any).window = globalThis;
+        let messageHandler: ((e: any) => void) | null = null;
+        class FakeEventSource {
+            url: string;
+            constructor(url: string) {
+                this.url = url;
+            }
+            set onmessage(fn: (e: any) => void) {
+                messageHandler = fn;
+            }
+            close() {}
+        }
+        (globalThis as any).EventSource = FakeEventSource;
+
+        const receivedBars: any[] = [];
+        const unsub = provider.subscribe('CRYPTO_IDX', '1', (bar) => {
+            receivedBars.push(bar);
+        });
+
+        expect(messageHandler).toBeDefined();
+
+        // Simulate incoming live tick frame from Binomo WebSocket
+        messageHandler!({
+            data: JSON.stringify({
+                topic: 'range_stream:Z-CRY/IDX',
+                event: 'range_stream',
+                payload: {
+                    rate: 7600.5,
+                    created_at: '2026-09-27T10:00:30.000Z',
+                },
+            }),
+        });
+
+        expect(receivedBars.length).toBeGreaterThan(0);
+        const last = receivedBars[receivedBars.length - 1];
+        expect(last.close).toBe(7600.5);
+        expect(last.time).toBe(new Date('2026-09-27T10:00:00.000Z').getTime());
+
+        // Simulate higher high tick in the same 1m window
+        messageHandler!({
+            data: JSON.stringify({
+                topic: 'range_stream:Z-CRY/IDX',
+                event: 'range_stream',
+                payload: {
+                    rate: 7615.0,
+                    created_at: '2026-09-27T10:00:45.000Z',
+                },
+            }),
+        });
+
+        const updated = receivedBars[receivedBars.length - 1];
+        expect(updated.close).toBe(7615.0);
+        expect(updated.high).toBe(7615.0);
+
+        // Test live tick at second 08 of forming minute with partial candle payload
+        messageHandler!({
+            data: JSON.stringify({
+                topic: 'range_stream:Z-CRY/IDX',
+                event: 'candle',
+                payload: {
+                    open: 7600.0,
+                    high: 7620.0,
+                    low: 7595.0,
+                    close: 7618.5,
+                    created_at: '2026-09-27T10:01:08.000Z', // 8s into 10:01:00 minute
+                },
+            }),
+        });
+
+        const liveSecond8Bar = receivedBars[receivedBars.length - 1];
+        expect(liveSecond8Bar.time).toBe(new Date('2026-09-27T10:01:00.000Z').getTime());
+        expect(liveSecond8Bar.close).toBe(7618.5);
+
+        unsub();
     });
 });

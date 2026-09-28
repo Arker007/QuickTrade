@@ -119,6 +119,42 @@ describe('NativeRenderer forming-bar glide', () => {
         expect(off.r.readFeature('animLiveBar')).toBe(LIVE_BAR_EASE_DEFAULT_MS);
     });
 
+    it('adjusts wicks dynamically relative to live animated price during upward and downward moves', () => {
+        const { r, anyR } = makeRenderer(100);
+        r.setBars([bar(1000, 100), { time: 2000, open: 100, high: 105, low: 98, close: 105, volume: 1 }]);
+        r.updateBar({ time: 2000, open: 100, high: 105, low: 98, close: 105, volume: 1 });
+        expect(anyR.liveEaseClose).toBe(105);
+        expect(anyR.liveEaseHigh).toBe(105);
+        expect(anyR.liveEaseLow).toBe(98);
+
+        // Tick surges upward creating a new high
+        r.updateBar({ time: 2000, open: 100, high: 120, low: 98, close: 120, volume: 1 });
+        anyR.easeLiveBar(20);
+        expect(anyR.liveEaseClose).toBeGreaterThan(105);
+        expect(anyR.liveEaseHigh).toBeGreaterThanOrEqual(anyR.liveEaseClose);
+        expect(anyR.liveEaseLow).toBeLessThanOrEqual(anyR.liveEaseClose);
+
+        // Settle upward move
+        while (anyR.easeLiveBar(20)) {}
+        expect(anyR.liveEaseClose).toBe(120);
+        expect(anyR.liveEaseHigh).toBe(120);
+
+        // Tick drops downward below open to 90
+        r.updateBar({ time: 2000, open: 100, high: 120, low: 90, close: 90, volume: 1 });
+        anyR.easeLiveBar(20);
+        expect(anyR.liveEaseClose).toBeLessThan(120);
+        // High wick remains retained at 120 from previous spike
+        expect(anyR.liveEaseHigh).toBe(120);
+        // Low wick dynamically encompasses moving live close
+        expect(anyR.liveEaseLow).toBeLessThanOrEqual(anyR.liveEaseClose);
+
+        // Settle downward move
+        while (anyR.easeLiveBar(20)) {}
+        expect(anyR.liveEaseClose).toBe(90);
+        expect(anyR.liveEaseLow).toBe(90);
+        expect(anyR.liveEaseHigh).toBe(120);
+    });
+
     it('the renderer feature accepts `true` (default duration) and clamps numbers', () => {
         const { r } = makeRenderer(0);
         r.applyFeature('animLiveBar', true);

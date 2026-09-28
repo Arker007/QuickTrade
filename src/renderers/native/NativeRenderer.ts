@@ -48,6 +48,7 @@ import { WebGL2Backend } from './backend/WebGL2Backend';
 import { CoordinateSystem, type PaneBounds, type PriceScale } from './core/CoordinateSystem';
 import { Scheduler, InvalidateLevel, repaintsData, repaintsChrome } from './core/Scheduler';
 import { Animator, EaseSetting, easeToward } from './core/Animator';
+import { SmoothCandleEngine } from './core/SmoothCandleEngine';
 import { InputController } from './core/InputController';
 import { KeyboardController } from './core/KeyboardController';
 import { SceneGraph, paneLogScale, paneScaleMode, paneInvert, type PaneNode, type HighlightArea, type SessionZones, type ScaleMode } from './core/SceneGraph';
@@ -298,6 +299,7 @@ export class NativeRenderer implements IChartRenderer {
     private vpvrHidden = false; // …but hidden via its legend eye (config kept)
 
     // ── live (forming) bar easing: the last bar's high/low/close glide toward each tick instead of snapping ──
+    private readonly smoothCandle = new SmoothCandleEngine();
     private liveEaseTime = 0; // open-time of the bar currently being eased (0 = none)
     private liveEaseHigh = 0;
     private liveEaseLow = 0;
@@ -1946,6 +1948,7 @@ export class NativeRenderer implements IChartRenderer {
             if (!this.animLiveBar.on || this.liveEaseTime !== bar.time) {
                 this.syncLiveEase(bar); // glide off, or the first tick of this bar: snap
             } else {
+                this.smoothCandle.onTick(bar.close, bar.high, bar.low);
                 this.animator.start(); // glide the displayed high/low/close toward this tick
             }
         } else if (!last || bar.time > last.time) {
@@ -1975,21 +1978,22 @@ export class NativeRenderer implements IChartRenderer {
         this.liveEaseHigh = bar.high;
         this.liveEaseLow = bar.low;
         this.liveEaseClose = bar.close;
+        this.smoothCandle.init(bar.open, bar.high, bar.low, bar.close, bar.time, this.animLiveBar.tau);
     }
 
     /** Glide the forming bar's displayed high/low/close toward the actual latest. Returns true while easing. */
     private easeLiveBar(dtMs: number): boolean {
         const target = this.bars[this.bars.length - 1];
         if (!target || this.liveEaseTime !== target.time) return false;
-        const eps = Math.max(1e-9, Math.abs(target.close) * 1e-6);
-        const tau = this.animLiveBar.tau; // 0 ⇒ easeToward returns the target (a mid-glide switch-off snaps)
-        const nh = easeToward(this.liveEaseHigh, target.high, dtMs, tau);
-        const nl = easeToward(this.liveEaseLow, target.low, dtMs, tau);
-        const nc = easeToward(this.liveEaseClose, target.close, dtMs, tau);
-        const active = Math.abs(nh - target.high) > eps || Math.abs(nl - target.low) > eps || Math.abs(nc - target.close) > eps;
-        this.liveEaseHigh = active ? nh : target.high;
-        this.liveEaseLow = active ? nl : target.low;
-        this.liveEaseClose = active ? nc : target.close;
+        if (!this.animLiveBar.on || this.animLiveBar.tau <= 0) {
+            this.syncLiveEase(target);
+            return false;
+        }
+
+        const active = this.smoothCandle.update(dtMs);
+        this.liveEaseHigh = this.smoothCandle.high;
+        this.liveEaseLow = this.smoothCandle.low;
+        this.liveEaseClose = this.smoothCandle.close;
         return active;
     }
 
@@ -3581,10 +3585,9 @@ export class NativeRenderer implements IChartRenderer {
                     pane.scaleTarget = expandScaleByPixels(folded, pane.bounds.height, th.abovePx, th.belowPx);
                 }
             }
-            // Idle → snap. While zooming/flinging the animator eases pane.scale toward
-            // the target (gliding autoscale) — EXCEPT an uninitialized pane (added
-            // mid-gesture) snaps once so it doesn't flash-ease from the {0,1} placeholder.
-            if (!animating || !pane.initialized) {
+            // Idle or autoscale-ease off → snap. While zooming/flinging with animAutoscale enabled,
+            // the animator eases pane.scale toward the target — EXCEPT an uninitialized pane snaps once.
+            if (!animating || !pane.initialized || this.animAutoscale.tau === 0) {
                 pane.scale = { ...pane.scaleTarget };
                 pane.initialized = true;
             }

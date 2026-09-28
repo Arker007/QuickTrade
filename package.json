@@ -101,6 +101,7 @@
     "playground": "vite"
   },
   "devDependencies": {
+    "@types/ws": "^8.18.1",
     "eslint": "^9.0.0",
     "jsdom": "^29.1.1",
     "tsup": "^8.0.0",
@@ -118,6 +119,7 @@
     "@zag-js/tooltip": "^1.42.0",
     "@zag-js/types": "^1.42.0",
     "@zag-js/vanilla": "^1.42.0",
-    "pinets": "^0.9.34"
+    "pinets": "^0.9.34",
+    "ws": "^8.22.0"
   }
 }

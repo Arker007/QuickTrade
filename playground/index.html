@@ -13,15 +13,109 @@
                 margin: 0;
                 height: 100%;
                 background: #131722;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
             }
             #chart {
                 position: absolute;
                 inset: 0;
             }
+            .controls-overlay {
+                position: absolute;
+                top: 60px;
+                right: 20px;
+                background: rgba(28, 33, 40, 0.95);
+                border: 1px solid #373e47;
+                border-radius: 8px;
+                padding: 12px;
+                z-index: 99999;
+                box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                color: #adbac7;
+                font-size: 11px;
+            }
+            .controls-overlay h3 {
+                margin: 0 0 4px 0;
+                font-size: 12px;
+                color: #539bf5;
+                font-weight: 600;
+            }
+            .controls-overlay .btn-group {
+                display: flex;
+                gap: 6px;
+            }
+            .controls-overlay button {
+                background: #347d39;
+                color: #fff;
+                border: none;
+                padding: 6px 10px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-weight: 600;
+                font-size: 11px;
+                transition: background 0.2s ease;
+            }
+            .controls-overlay button:hover {
+                background: #46954a;
+            }
+            .controls-overlay button.down {
+                background: #ae2c2c;
+            }
+            .controls-overlay button.down:hover {
+                background: #c93c3c;
+            }
+            .controls-overlay select {
+                background: #22272e;
+                color: #adbac7;
+                border: 1px solid #373e47;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 11px;
+                outline: none;
+                width: 100%;
+            }
+            .controls-overlay .label-text {
+                font-size: 10px;
+                color: #768390;
+                margin-top: 2px;
+            }
         </style>
     </head>
     <body>
         <div id="chart"></div>
+
+        <div class="controls-overlay">
+            <h3>Interpolation Controls</h3>
+            <div class="btn-group">
+                <button onclick="triggerManualTick(25)">+25 Tick (UP)</button>
+                <button class="down" onclick="triggerManualTick(-25)">-25 Tick (DOWN)</button>
+            </div>
+            <div>
+                <div class="label-text" style="margin-bottom: 3px;">Algorithm:</div>
+                <select id="algoSelect" onchange="changeInterpolationAlgo(this.value)">
+                    <option value="decay">Exponential Decay (Binomo Native α=0.12)</option>
+                    <option value="spring">Spring-Damper Physics (Elastic)</option>
+                    <option value="step">Raw Step (No Interpolation)</option>
+                </select>
+            </div>
+        </div>
+
+        <script>
+            function triggerManualTick(delta) {
+                if (typeof window.triggerBinomoDelta === 'function') {
+                    window.triggerBinomoDelta(delta);
+                } else {
+                    console.warn('Binomo subscription is not active. Switch to a Binomo symbol (e.g., CRYPTO_IDX) to test live ticks.');
+                }
+            }
+
+            function changeInterpolationAlgo(val) {
+                window.BINOMO_INTERPOLATION_ALGO = val;
+                console.log('Interpolation algorithm changed to:', val);
+            }
+        </script>
+
         <script type="module" src="./widget.ts"></script>
     </body>
 </html>

@@ -46,6 +46,7 @@ const ws = new VelaWorkspace("#workspace", {
     demo: () => new DemoEngine(),
   },
   defaultLanguage: "pine",
+  animations: { liveBar: true },
   indicators: [
     {
       name: "EMA 20",

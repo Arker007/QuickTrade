@@ -9,8 +9,13 @@ All notable changes to Vela, newest first.
 - **Biquote market-data provider.** Connect charts to Biquote (`https://biquote.io/api`), sourcing multi-asset OHLCV candlestick bars from MT5 historical feeds, real-time tick aggregation, and bootstrap data. Supports M1 through D1 native timeframes (`1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`) with automated intraday and calendar aggregation for secondary intervals (`3m`, `2h`, `6h`, `8h`, `12h`, `1w`, and `1M`), date range filters (`from`, `to`), and live forming candle updates (`isOpen`).
 - **Favorite symbols and quick filtering.** Star any symbol directly from the symbol search dialog to mark it as a favorite, matching the behavior of timeframe favorites. A dedicated **Favorites** tab in the symbol picker displays all starred assets in one place, with instant toggle updates and persistence across workspace state documents (`symbolFavorites`).
 
+### Changed
+
+- **Dynamic live candle wick interpolation.** The forming-bar live easing animation (`animations.liveBar`) dynamically bounds candle high and low wicks relative to the animated live close and candle open across every frame. During rapid upward or downward price swings, wicks continuously track and enclose the moving candle body without lag, settling seamlessly into the final bar extremes.
+
 ### Fixed
 
+- **Binomo 1-minute live candle timestamps.** Live forming candles and historical 1-minute candles for Crypto IDX and other Binomo symbols now align to candle open times instead of close times, ensuring the active bar, time-axis labels, and countdown-to-close timer reflect the current minute accurately.
 - **Binomo volume indicator and aggregation.** Candle volume is now properly extracted and accumulated across bar aggregations (5m, 15m, 1h, 1D, 1W, 1M) and tick range activity for `CRYPTO_IDX` and all Binomo assets, enabling the Volume study and volume indicators to function correctly.
 - **Binomo high-precision price chip and axis tick formatting.** Binomo live price line tags and crosshairs now display full 10-decimal precision (e.g., `641.8674347561`) inside pointed left-arrow badge chips, while price axis grid line ticks format cleanly to step precision (e.g., `641.8674`), exactly matching the Binomo visual layout.
 - **Data feed range limits on warm cache.** Count-bounded range queries (`loadRange` with `limit`) now correctly enforce the limit on a warmed cache rather than returning the entire cached dataset.
